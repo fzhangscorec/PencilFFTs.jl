@@ -230,6 +230,7 @@ struct PencilFFTPlan{
 
     function PencilFFTPlan(
             A::PencilArray, transforms::AbstractTransformList;
+            output_axes = nothing,
             fftw_flags = FFTW.ESTIMATE,
             fftw_timelimit = FFTW.NO_TIMELIMIT,
             permute_dims::ValBool = Val(true),
@@ -248,6 +249,7 @@ struct PencilFFTPlan{
         # Options for creation of 1D plans.
         plans = _create_plans(
             A, g;
+            output_axes = output_axes,
             permute_dims = permute_dims,
             ibuf = ibuf,
             timer = timer,
@@ -280,6 +282,7 @@ end
 function PencilFFTPlan(
         dims_global::Dims{Nt}, transforms::AbstractTransformList{Nt},
         proc_dims::Dims{Nd}, comm::MPI.Comm, ::Type{Tr} = Float64;
+        output_axes=nothing,
         extra_dims::Dims{Ne} = (),
         timer = TimerOutput(),
         ibuf = UInt8[],
@@ -289,7 +292,7 @@ function PencilFFTPlan(
     pen = _make_input_pencil(dims_global, t, timer)
     T = _input_data_type(Tr, transforms...)
     A = _temporary_pencil_array(T, pen, ibuf, extra_dims)
-    PencilFFTPlan(A, transforms; timer = timer, ibuf = ibuf, kws...)
+    PencilFFTPlan(A, transforms; output_axes = output_axes, timer = timer, ibuf = ibuf, kws...)
 end
 
 function PencilFFTPlan(A, transform::AbstractTransform,
@@ -374,7 +377,7 @@ function _create_plans(
         ::Type{Ti}, g::GlobalFFTParams{T,N} where T,
         Ai::PencilArray, plan_prev, transform_fw::AbstractTransform,
         transforms_next::Vararg{AbstractTransform,Ntr};
-        timer, ibuf, fftw_kw, permute_dims,
+        output_axes, timer, ibuf, fftw_kw, permute_dims,
     ) where {Ti, N, Ntr}
     dim = Val(N - Ntr)  # current dimension index
     n = N - Ntr
@@ -382,6 +385,10 @@ function _create_plans(
     so = g.size_global_out
 
     Pi = pencil(Ai)
+
+    if output_axes !== nothing && length(transforms_next) == 0
+        @assert output_axes == Pi.axes_all
+    end
 
     # Output transform along dimension `n`.
     Po = let dims = ntuple(j -> j ≤ n ? so[j] : si[j], Val(N))
@@ -400,14 +407,14 @@ function _create_plans(
 
     # These are both `nothing` when there's no transforms left
     Pi_next = _make_intermediate_pencil(
-        g, topology(Pi), Val(n + 1), plan_n, timer, permute_dims)
+        g, topology(Pi), Val(n + 1), plan_n, timer, permute_dims, output_axes)
     Ai_next = _temporary_pencil_array(To, Pi_next, ibuf, extra_dims(Ai))
 
     (
         plan_n,
         _create_plans(
             To, g, Ai_next, plan_n, transforms_next...;
-            timer = timer, ibuf = ibuf, fftw_kw = fftw_kw, permute_dims = permute_dims,
+            output_axes = output_axes, timer = timer, ibuf = ibuf, fftw_kw = fftw_kw, permute_dims = permute_dims,
         )...,
     )
 end
@@ -434,6 +441,7 @@ function _make_intermediate_pencil(
         topology::MPITopology{M}, dim::Val{n},
         plan_prev::PencilPlan1D, timer,
         permute_dims::ValBool,
+        output_axes = nothing,
     ) where {N, M, n}
     @assert n ≥ 2  # this is an intermediate pencil
     n > N && return nothing
@@ -461,9 +469,24 @@ function _make_intermediate_pencil(
     # decomposition dimensions.
     @assert allunique(decomp)
 
+    _output_axes = nothing
+    if output_axes !== nothing
+        _output_axes = similar(output_axes)
+        for I in CartesianIndices(output_axes)
+            _output_axes[I] = ntuple(Val(N)) do i
+                if i == n
+                    return 1:Po_prev.size_global[n]
+                end
+                if i == n - 1
+                    return output_axes[I][i]
+                end
+                return Po_prev.axes_all[I][i]
+            end
+        end
+    end
     # Create new pencil sharing some information with Po_prev.
     # (Including dimensions, MPI topology and data buffers.)
-    Pencil(Po_prev, decomp_dims=decomp, permute=perm, timer=timer)
+    Pencil(Po_prev, _output_axes, decomp_dims=decomp, permute=perm, timer=timer)
 end
 
 # No permutations
